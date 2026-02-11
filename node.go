@@ -32,6 +32,7 @@ type Node struct {
 	Client           *Client
 	marker           *failMarker
 	Bypass           *Bypass
+	FullString       string
 }
 
 // ParseNode parses the node info.
@@ -59,6 +60,7 @@ func ParseNode(s string) (node Node, err error) {
 		User:   u.User,
 		marker: &failMarker{},
 		url:    u,
+		FullString: s,
 	}
 
 	u.RawQuery = ""
@@ -113,6 +115,8 @@ func ParseNode(s string) (node Node, err error) {
 	case "ftcp": // fake TCP
 	case "dns", "dot", "doh":
 	case "relay":
+	case "smbnp":
+		node.Transport = "smbnp"
 	default:
 		node.Protocol = ""
 	}
