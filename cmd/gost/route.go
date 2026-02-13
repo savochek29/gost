@@ -244,7 +244,7 @@ func parseChainNode(ns string) (nodes []gost.Node, err error) {
 		tr = gost.UDPTransporter()
 	case "vsock":
 		tr = gost.VSOCKTransporter()
-	case "smb":
+	case "smbnp":
 		fmt.Println(node.FullString)
 		tr = gost.SMBNPTransporter(node.FullString)
 	default:
@@ -569,7 +569,7 @@ func (r *route) GenRouters() ([]router, error) {
 				Backlog:   node.GetInt("backlog"),
 				QueueSize: node.GetInt("queue"),
 			})
-		case "smb":
+		case "smbnp":
 			ln, err = gost.SMBNPListener(node.Addr)
 		default:
 			ln, err = gost.TCPListener(node.Addr)
