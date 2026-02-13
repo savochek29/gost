@@ -2,14 +2,11 @@ package gost
 
 import (
 	"net"
-	// "fmt"
 	"syscall"
 	"strings"
-	// "io"
 	"time"
 	"errors"
-	"unsafe"
-	// "github.com/hashicorp/yamux"
+	"github.com/hashicorp/yamux"
 	"golang.org/x/sys/windows"
     "crypto/rand"
     "encoding/hex"
@@ -17,8 +14,8 @@ import (
 
 type smbnpTransporter struct{
 	pipeName string
+	mux *yamux.Session
 	path string
-
 }
 
 func SMBNPTransporter(url string) Transporter {
@@ -27,29 +24,48 @@ func SMBNPTransporter(url string) Transporter {
 	host := strings.Split(parts[2], ":")[0]
 	path := `\\` + host + `\pipe\`
 
-	return &smbnpTransporter{pipeName, path}
+	return &smbnpTransporter{pipeName, nil, path}
 }
 
 func (tr *smbnpTransporter) Dial(addr string, options ...DialOption) (net.Conn, error) {
 
-	conn, err := pipeDial(tr.path + tr.pipeName)
+	if tr.mux == nil {
+		conn, err := pipeDial(tr.path + tr.pipeName)
+		if err != nil {
+			return nil, err
+		}
+
+		conn.Write([]byte("0"))
+
+		newNameB := make([]byte, 100)
+		length, err := conn.Read(newNameB)
+		if err != nil {
+			return nil, err
+		}
+		new_name := string(newNameB[:length])
+
+		conn2, err := pipeDial(tr.path + tr.pipeName)
+		if err != nil {
+			return nil, err
+		}
+
+		conn2.Write([]byte(new_name))
+		conn2.Read(newNameB)
+
+		conn_duplex := &PipeConnDuplex{tr.path + tr.pipeName, conn2, conn}
+
+		tr.mux, err = yamux.Client(conn_duplex, nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	conn, err := tr.mux.Open()
 	if err != nil {
 		return nil, err
 	}
 
-	newNameB := make([]byte, 100)
-	length, err := conn.Read(newNameB)
-	if err != nil {
-		return nil, err
-	}
-	new_name := string(newNameB[:length])
-
-	conn_duplex, err := duplexPipeDial(tr.path, new_name)
-	if err != nil {
-		return nil, err
-	}
-
-	return conn_duplex, nil
+	return conn, nil
 }
 
 func (tr *smbnpTransporter) Handshake(conn net.Conn, options ...HandshakeOption) (net.Conn, error) {
@@ -61,40 +77,22 @@ func (tr *smbnpTransporter) Multiplex() bool {
 }
 
 type smbnpListener struct {
-	listener *pipeListener
+	listener *ConnDispatcher
 	pipeName string
 }
 
 func SMBNPListener(pipeName string) (Listener, error) {
 
-	listener := PipeListener(pipeName, nil)
+	disp := createPipeDispatcher(pipeName)
+	listener := &ConnDispatcher{disp, make(chan *yamux.Stream, 128)}
+	go listener.listenLoop()
 
 	return &smbnpListener{listener, pipeName}, nil
 }
 
 func (ln *smbnpListener) Accept() (c net.Conn, err error) {
-	conn, err := ln.listener.Accept()
-	if err != nil {
-		return nil, err
-	}
-
-	b := make([]byte, 4)
-	rand.Read(b)
-	new_name := hex.EncodeToString(b)
-
-	pd, err := CreatePipeDuplex(new_name, func() { conn.Write([]byte(new_name)) })
-	if err != nil {
-		return nil, err
-	}
-	
-	dupconn, err := pd.Accept()
-	if err != nil {
-		return nil, err
-	}
-
-	conn.Close()
-
-	return dupconn, nil
+	conn := ln.listener.Accept()
+	return conn, nil
 }
 func (ln *smbnpListener) Addr() net.Addr {
 	return &net.UnixAddr{Name: `\\.\pipe\`+ln.pipeName, Net: "smbnp"}
@@ -152,7 +150,7 @@ func (ln *pipeListener) listenLoop(fn func()) {
 
 		handle, err := windows.CreateNamedPipe(
 			windows.StringToUTF16Ptr(ln.path + ln.name),
-			windows.PIPE_ACCESS_DUPLEX,
+			windows.PIPE_ACCESS_DUPLEX|windows.FILE_FLAG_OVERLAPPED,
 			windows.PIPE_TYPE_BYTE|windows.PIPE_READMODE_BYTE|windows.PIPE_WAIT,
 			windows.PIPE_UNLIMITED_INSTANCES,
 			65536,
@@ -198,34 +196,34 @@ func (c *PipeConn) Close() error {
 
 func (c *PipeConn) Read(p []byte) (int, error) {
 	var read uint32
-	var actual_read uint32
+	// var actual_read uint32
 
-	err := windows.ReadFile(c.handle, (*(*[4]byte)(unsafe.Pointer(&actual_read)))[:], &read, nil)
+	// err := windows.ReadFile(c.handle, (*(*[4]byte)(unsafe.Pointer(&actual_read)))[:], &read, nil)
+	// if err != nil {
+	// 	return 0, err
+	// }
+
+	buf := make([]byte, 4096)
+
+	err := windows.ReadFile(c.handle, buf, &read, nil)
 	if err != nil {
 		return 0, err
 	}
-
-	buf := make([]byte, actual_read)
-
-	err = windows.ReadFile(c.handle, buf, &read, nil)
-	if err != nil {
-		return 0, err
-	}
-	copy(p, buf)
+	copy(p, buf[:read])
 
 	return int(read), nil
 }
 
 func (c *PipeConn) Write(p []byte) (int, error) {
 	var written uint32
-	to_write := uint32(len(p))
+	// to_write := uint32(len(p))
 
-	err := windows.WriteFile(c.handle, (*(*[4]byte)(unsafe.Pointer(&to_write)))[:], &written, nil)
-	if err != nil {
-		return 0, err
-	}
+	// err := windows.WriteFile(c.handle, (*(*[4]byte)(unsafe.Pointer(&to_write)))[:], &written, nil)
+	// if err != nil {
+	// 	return 0, err
+	// }
 
-	err = windows.WriteFile(c.handle, p, &written, nil)
+	err := windows.WriteFile(c.handle, p, &written, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -272,12 +270,13 @@ type PipeConnDuplex struct {
 }
 
 func duplexPipeDial(path string, name string) (*PipeConnDuplex, error) {
-	in_path := path + name + `.out`
+	in_path := path + name + `.in`
 	out_path := path + name + `.in`
 	in_conn, err := pipeDial(in_path)
 	if err != nil {
 		return nil, err
 	}
+	// time.Sleep(1 * time.Second)
 	out_conn, err := pipeDial(out_path)
 	if err != nil {
 		return nil, err
@@ -303,7 +302,7 @@ func (c *PipeConnDuplex) LocalAddr() net.Addr  {
 	return &net.UnixAddr{Name: c.in.path, Net: "smbnp"}
 }
 func (c *PipeConnDuplex) RemoteAddr() net.Addr {
-	return &net.UnixAddr{Name: c.out.path, Net: "smbnp"}
+	return &net.UnixAddr{Name: c.in.path, Net: "smbnp"}
 }
 
 func (*PipeConnDuplex) SetDeadline(t time.Time) error      { return nil }
@@ -313,25 +312,22 @@ func (*PipeConnDuplex) SetWriteDeadline(t time.Time) error { return nil }
 type PipeDuplex struct {
 	name string
 	in *pipeListener
-	out *pipeListener
 }
 
 func CreatePipeDuplex(name string, fn func()) (*PipeDuplex, error) {
 	in_path := name + `.in`
-	out_path := name + `.out`
-	c := make(chan struct{}, 2)
+	// out_path := name + `.in`
+	// c := make(chan struct{}, 2)
 	var in_listener *pipeListener
-	var out_listener *pipeListener
-	go func() {
-		in_listener = PipeListener(in_path, func() { c <- struct{}{}; })
-	}()
-	go func() {
-		out_listener = PipeListener(out_path, func() { c <- struct{}{}; })
-	}()
-	_ = <-c
-	_ = <-c
+	// var out_listener *pipeListener
+	in_listener = PipeListener(in_path, nil)
+	// go func() {
+	// 	out_listener = PipeListener(out_path, func() { c <- struct{}{}; })
+	// }()
+	// _ = <-c
+	// _ = <-c
 	fn()
-	return &PipeDuplex{name, in_listener, out_listener}, nil
+	return &PipeDuplex{name, in_listener}, nil
 }
 
 func (pd *PipeDuplex) Accept() (*PipeConnDuplex, error) {
@@ -339,11 +335,89 @@ func (pd *PipeDuplex) Accept() (*PipeConnDuplex, error) {
 	if err != nil {
 		return nil, err
 	}
-	out_conn, err := pd.out.Accept()
+	out_conn, err := pd.in.Accept()
 	if err != nil {
 		return nil, err
 	}
 	in_conn_pipe, _ := in_conn.(*PipeConn)
 	out_conn_pipe, _ := out_conn.(*PipeConn)
 	return &PipeConnDuplex{pd.name, in_conn_pipe, out_conn_pipe}, nil
+}
+
+type PipeDispatcher struct {
+	listener *pipeListener
+	chans map[string] chan *PipeConn
+	initc chan string
+}
+
+func createPipeDispatcher(path string) (*PipeDispatcher) {
+	listener := PipeListener(path, nil)
+	pd := &PipeDispatcher{listener, make(map[string] chan *PipeConn), make(chan string, 1024)}
+	go pd.listenLoop()
+	return pd
+}
+
+func (pd *PipeDispatcher) listenLoop() {
+	for {
+		conn, err := pd.listener.Accept()
+		if err != nil {
+			continue
+		}
+		cmd := make([]byte, 100)
+		l, err := conn.Read(cmd)
+		if err != nil {
+			conn.Close()
+			continue
+		}
+		if l == 1 { // CONNECT
+			b := make([]byte, 4)
+			rand.Read(b)
+			conn_id := hex.EncodeToString(b)
+			pd.chans[conn_id] = make(chan *PipeConn, 10)
+			pd.initc <- conn_id
+			pd.chans[conn_id] <- conn.(*PipeConn)
+			conn.Write([]byte(conn_id))
+		} else { // SECOND
+			conn_id := string(cmd[:l])
+			pd.chans[conn_id] <- conn.(*PipeConn)
+			conn.Write([]byte("0"))
+			delete(pd.chans, conn_id)
+		}
+	}
+}
+
+func (pd *PipeDispatcher) Accept() (*PipeConnDuplex) {
+	conn_id := <- pd.initc
+	conn1 := <- pd.chans[conn_id]
+	conn2 := <- pd.chans[conn_id]
+	return &PipeConnDuplex{pd.listener.path, conn1, conn2}
+}
+
+type ConnDispatcher struct {
+	listener *PipeDispatcher
+	connCh chan *yamux.Stream
+}
+
+func (cd *ConnDispatcher) listenLoop() {
+	for {
+		conn := cd.listener.Accept()
+		session, err := yamux.Server(conn, nil)
+		if err != nil {
+			continue
+		}
+		go func() {
+			for {
+				stream, err := session.Accept()
+				if err != nil {
+					break
+				}
+				cd.connCh <- stream.(*yamux.Stream)
+			}
+		}()
+	}
+}
+
+func (cd *ConnDispatcher) Accept() (*yamux.Stream) {
+	conn := <- cd.connCh
+	return conn
 }
